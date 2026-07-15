@@ -22,7 +22,7 @@ use crate::state_manager::ExecutedTipset;
 use crate::utils::db::{BlockstoreExt, CborStoreExt};
 use crate::{
     blocks::{CachingBlockHeader, Tipset, TipsetKey, TxMeta},
-    db::{DbImpl, EthMappingsStore as _, EthMappingsStoreExt as _, HeaviestTipsetKeyProvider},
+    db::{DbImpl, EthMappingsStoreExt as _, HeaviestTipsetKeyProvider},
     message::{ChainMessage, SignedMessage},
 };
 use crate::{fil_cns, utils::cache::SizeTrackingCache};
@@ -207,15 +207,24 @@ impl ChainStore {
         head.key().save(self.db())?;
         self.db().set_heaviest_tipset_key(head.key())?;
 
+        let finalized_epoch = ChainGetTipSetFinalityStatus::get_ec_finality_epoch(
+            self.chain_index(),
+            self.chain_config(),
+            &head,
+        );
+        self.ec_calculator_finalized_epoch
+            .store(finalized_epoch, atomic::Ordering::Release);
+
         // Updating tipset lookup table
         {
-            if ChainIndex::is_tipset_lookup_checkpoint(head.epoch())
-                && let Err(e) = self.db().set_tipset_key_at_epoch(&head)
+            // Only ever record finalized ancestors of the head. Recording the head itself
+            // is unsound: it is not finalized and may turn out to be a partial tipset or a
+            // fork block, permanently poisoning lookups once the epoch finalizes.
+            if let Err(e) = self
+                .chain_index
+                .update_tipset_lookup_for_finalized_head(&head, finalized_epoch)
             {
-                error!(
-                    "failed to update tipset lookup table at epoch {}: {e:#?}",
-                    head.epoch()
-                );
+                error!("failed to update tipset lookup table: {e:#?}");
             }
             // Fix stale lookups at null rounds which could be caused by chain reorg.
             // This is a no-op in most of the cases so it's OK to always run.
@@ -232,14 +241,6 @@ impl ChainStore {
         }
 
         let old_head = self.heaviest_tipset.swap(head.shallow_clone().into());
-        self.ec_calculator_finalized_epoch.store(
-            ChainGetTipSetFinalityStatus::get_ec_finality_epoch(
-                self.chain_index(),
-                self.chain_config(),
-                &head,
-            ),
-            atomic::Ordering::Release,
-        );
         if crate::utils::broadcast::has_subscribers(&self.head_changes_tx) {
             let changes = match crate::rpc::chain::chain_get_path(self, old_head.key(), head.key())
             {

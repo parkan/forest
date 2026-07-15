@@ -209,19 +209,13 @@ impl ChainIndex {
             return Ok(Some(from));
         }
 
+        // Note: the walk deliberately does NOT populate the lookup table. `from` can be
+        // any tipset (an unvalidated candidate chain from a peer, an RPC-supplied tipset
+        // key), so tipsets encountered here are not guaranteed to be on the canonical
+        // chain even at finalized epochs. The table is populated exclusively from the
+        // canonical head: see [`Self::update_tipset_lookup_for_finalized_head`] and the
+        // startup warmup in the daemon.
         for (child, parent) in from.chain(&self.db).tuple_windows() {
-            // update cache only when child is finalized.
-            if Self::is_tipset_lookup_checkpoint(child.epoch())
-                && is_epoch_finalized(child.epoch())
-                && let Err(e) = self.db.set_tipset_key_at_epoch(&child)
-            {
-                tracing::warn!(
-                    "failed to update tipset height cache, epoch: {}, key: {}, error: {e}",
-                    child.epoch(),
-                    child.key()
-                );
-            }
-
             if to == child.epoch() {
                 return Ok(Some(child));
             }
@@ -304,6 +298,68 @@ impl ChainIndex {
     pub fn is_tipset_lookup_checkpoint(epoch: ChainEpoch) -> bool {
         // Genesis is not considered a checkpoint
         epoch > 0 && epoch.mod_floor(&TIPSET_LOOKUP_CHECKPOINT_INTERVAL) == 0
+    }
+
+    /// Keeps the epoch-to-tipset-key lookup table in sync with the canonical chain as the
+    /// head advances.
+    ///
+    /// Resolves the `head`'s ancestor at the newest lookup-checkpoint epoch at or below
+    /// `finalized_epoch` with a plain parent walk (deliberately bypassing the lookup table
+    /// this method maintains) and writes, corrects, or deletes the entry so that it matches.
+    ///
+    /// This is the only runtime writer of the table. Writing only finalized ancestors of the
+    /// canonical head upholds the invariant the lookup shortcut in
+    /// [`Self::tipset_by_height_blocking`] relies on: an entry at a finalized epoch is on the
+    /// canonical chain. Writing the head itself is unsound: the head is not finalized, and if
+    /// it lands on a checkpoint epoch as a partial tipset or a fork block that later loses to
+    /// the canonical chain, the stale entry corrupts randomness and `tipset_cid` lookups for
+    /// every later state computation, wedging the node (this caused a mainnet node to be
+    /// permanently stuck on 2026-07-12).
+    pub fn update_tipset_lookup_for_finalized_head(
+        &self,
+        head: &Tipset,
+        finalized_epoch: ChainEpoch,
+    ) -> anyhow::Result<()> {
+        let checkpoint_epoch =
+            finalized_epoch - finalized_epoch.mod_floor(&TIPSET_LOOKUP_CHECKPOINT_INTERVAL);
+        // Strictly below the head epoch: blocks for the head's epoch may still arrive
+        // (tipset expansion), so a tipset at that epoch is never final regardless of
+        // what the finality calculator reports.
+        if checkpoint_epoch <= 0 || checkpoint_epoch >= head.epoch() {
+            return Ok(());
+        }
+        // The ancestor of `head` at exactly `checkpoint_epoch`, or `None` if that
+        // epoch is a null round on the head's lineage.
+        let mut ancestor = None;
+        for ts in head.shallow_clone().chain(&self.db) {
+            match ts.epoch().cmp(&checkpoint_epoch) {
+                std::cmp::Ordering::Greater => continue,
+                std::cmp::Ordering::Equal => {
+                    ancestor = Some(ts);
+                    break;
+                }
+                std::cmp::Ordering::Less => break,
+            }
+        }
+        match (ancestor, self.db.tipset_key_by_epoch(checkpoint_epoch)?) {
+            (Some(ts), Some(ref tsk)) if ts.key() == tsk => {}
+            (Some(ts), prev) => {
+                if let Some(prev) = prev {
+                    tracing::warn!(
+                        "Correcting tipset lookup at epoch {checkpoint_epoch}: expected {}, found {prev}",
+                        ts.key(),
+                    );
+                }
+                self.db.set_tipset_key_at_epoch(&ts)?;
+            }
+            (None, Some(_)) => {
+                // Null round on the canonical chain, e.g. a stale entry left behind by a reorg.
+                self.db.delete_tipset_key_at_epoch(checkpoint_epoch)?;
+                info!("deleted tipset lookup at null epoch {checkpoint_epoch}");
+            }
+            (None, None) => {}
+        }
+        Ok(())
     }
 
     /// Cleans up stale checkpoints at null rounds between the given tipset and its parent in case there's chain reorg.
@@ -446,6 +502,172 @@ mod tests {
                 .expect("epoch 2 on branch b"),
             epoch2b
         );
+    }
+
+    /// Builds a chain with two competing tipsets at epoch 20 (a lookup checkpoint):
+    /// genesis, a single-block chain through epoch 19, two blocks at epoch 20
+    /// (`full` = both, canonical; `partial` = only the block that does NOT hold the
+    /// tipset's minimum ticket), and a canonical single-block chain 21..=30 built on
+    /// `full`. Returns `(genesis, partial, full, head)`.
+    fn chain_with_competing_tipsets_at_checkpoint(
+        db: &Arc<MemoryDB>,
+    ) -> (Tipset, Tipset, Tipset, Tipset) {
+        use crate::shim::address::Address;
+
+        let genesis = genesis_tipset();
+        persist_tipset(&genesis, db);
+        let mut prev = genesis.shallow_clone();
+        for epoch in 1..20 {
+            let ts = tipset_child(&prev, epoch);
+            persist_tipset(&ts, db);
+            prev = ts;
+        }
+        let full = Tipset::new([1, 2].map(|i| {
+            CachingBlockHeader::new(RawBlockHeader {
+                miner_address: Address::new_id(i),
+                parents: prev.key().clone(),
+                ticket: dummy_ticket(i as u8),
+                epoch: 20,
+                ..Default::default()
+            })
+        }))
+        .unwrap();
+        persist_tipset(&full, db);
+        let partial = Tipset::from(full.block_headers().last());
+        // Sanity for the incident scenario: chain randomness drawn at epoch 20
+        // diverges between the two tipsets.
+        assert_ne!(partial.min_ticket(), full.min_ticket());
+
+        let mut head = full.shallow_clone();
+        for epoch in 21..=30 {
+            let ts = tipset_child(&head, epoch);
+            persist_tipset(&ts, db);
+            head = ts;
+        }
+        (genesis, partial, full, head)
+    }
+
+    /// Regression test for the 2026-07-12 mainnet incident where a node got
+    /// permanently stuck at epoch 6184784 with `Parent state root did not match
+    /// computed state`.
+    ///
+    /// The node's head briefly landed on a fork tipset at a lookup-checkpoint epoch
+    /// (`epoch % 20 == 0`). [`ChainStore::set_heaviest_tipset`] used to persist the
+    /// unfinalized head into the epoch-to-tipset lookup table; once the chain
+    /// advanced on the competing canonical tipset, the stale entry was never
+    /// rewritten. As soon as the EC finality calculator declared the epoch
+    /// finalized, `tipset_by_height` short-circuited through the poisoned entry,
+    /// corrupting FVM chain randomness and `get_tipset_cid` (EVM `BLOCKHASH`) —
+    /// producing a deterministically wrong state root and wedging sync until a
+    /// restart repaired the table.
+    #[test]
+    fn tipset_by_height_does_not_resolve_stale_non_ancestor_checkpoint() {
+        use crate::chain::store::ChainStore;
+        use crate::db::EthMappingsStore;
+        use crate::networks::ChainConfig;
+
+        let db = Arc::new(MemoryDB::default());
+        let (genesis, partial, full, head) = chain_with_competing_tipsets_at_checkpoint(&db);
+
+        // Drive the real write path: the node's head lands on the partial tipset
+        // at checkpoint epoch 20, then follows the canonical chain.
+        let cs = ChainStore::new(db.clone(), Arc::new(ChainConfig::default()), genesis.clone())
+            .unwrap();
+        cs.set_heaviest_tipset(partial.shallow_clone()).unwrap();
+        cs.set_heaviest_tipset(head.shallow_clone()).unwrap();
+
+        // The abandoned head must not remain in the lookup table.
+        assert_ne!(
+            db.tipset_key_by_epoch(20).unwrap().as_ref(),
+            Some(partial.key()),
+            "unfinalized head must not be persisted in the lookup table",
+        );
+
+        // Reads consult the table once the epoch is considered finalized. In
+        // production `is_epoch_finalized` is backed by the EC finality calculator,
+        // which finalizes within ~20 epochs of head.
+        let index = ChainIndex::new(db, genesis).with_is_epoch_finalized(Arc::new(|e| e <= 25));
+        let resolved = index
+            .tipset_by_height_blocking(20, head, ResolveNullTipset::TakeOlder)
+            .unwrap()
+            .expect("epoch 20 resolved");
+        assert_eq!(
+            resolved, full,
+            "tipset_by_height must resolve the ancestor of `from`, not a stale checkpoint",
+        );
+    }
+
+    #[test]
+    fn update_tipset_lookup_for_finalized_head_writes_corrects_and_ignores() {
+        use crate::db::EthMappingsStore;
+
+        let db = Arc::new(MemoryDB::default());
+        let (genesis, partial, full, head) = chain_with_competing_tipsets_at_checkpoint(&db);
+        let index = ChainIndex::new(db.clone(), genesis);
+
+        // Nothing to do while no checkpoint epoch is finalized.
+        index
+            .update_tipset_lookup_for_finalized_head(&head, 19)
+            .unwrap();
+        assert_eq!(db.tipset_key_by_epoch(20).unwrap(), None);
+
+        // The finalized epoch itself is not a checkpoint: the newest checkpoint at
+        // or below it is recorded, with the head's actual ancestor.
+        index
+            .update_tipset_lookup_for_finalized_head(&head, 25)
+            .unwrap();
+        assert_eq!(
+            db.tipset_key_by_epoch(20).unwrap().as_ref(),
+            Some(full.key())
+        );
+
+        // A poisoned entry (e.g. left behind by an older forest version) is
+        // corrected at runtime, not only by the startup warmup.
+        db.set_tipset_key_at_epoch(&partial).unwrap();
+        index
+            .update_tipset_lookup_for_finalized_head(&head, 25)
+            .unwrap();
+        assert_eq!(
+            db.tipset_key_by_epoch(20).unwrap().as_ref(),
+            Some(full.key())
+        );
+
+        // A checkpoint epoch at or above the head epoch is never recorded, even if
+        // the finality calculator claims it is finalized.
+        let head20 = full.shallow_clone();
+        db.delete_tipset_key_at_epoch(20).unwrap();
+        index
+            .update_tipset_lookup_for_finalized_head(&head20, 20)
+            .unwrap();
+        assert_eq!(db.tipset_key_by_epoch(20).unwrap(), None);
+    }
+
+    #[test]
+    fn update_tipset_lookup_for_finalized_head_deletes_null_round_entry() {
+        use crate::db::EthMappingsStore;
+
+        let db = Arc::new(MemoryDB::default());
+        let genesis = genesis_tipset();
+        persist_tipset(&genesis, &db);
+        // Epoch 20 is a null round: 19 is followed directly by 21.
+        let mut prev = genesis.shallow_clone();
+        for epoch in [10, 19, 21, 30] {
+            let ts = tipset_child(&prev, epoch);
+            persist_tipset(&ts, &db);
+            prev = ts;
+        }
+        let head = prev;
+
+        // A stale entry at the null checkpoint epoch, e.g. left behind by a reorg.
+        let stale = tipset_child(&genesis, 20);
+        persist_tipset(&stale, &db);
+        db.set_tipset_key_at_epoch(&stale).unwrap();
+
+        let index = ChainIndex::new(db.clone(), genesis);
+        index
+            .update_tipset_lookup_for_finalized_head(&head, 25)
+            .unwrap();
+        assert_eq!(db.tipset_key_by_epoch(20).unwrap(), None);
     }
 
     #[test]
