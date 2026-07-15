@@ -110,6 +110,10 @@ pub struct ChainStore {
 
     /// Cache for messages in tipsets, keyed by tipset key.
     messages_in_tipset_cache: MessagesInTipsetCache,
+
+    /// Head epoch of the last [`Self::repair_tipset_lookup`] scan that found nothing to
+    /// repair, used to debounce repeated scans triggered by bursts of validation failures.
+    last_clean_lookup_repair_epoch: Arc<AtomicI64>,
 }
 
 impl ShallowClone for ChainStore {
@@ -125,6 +129,7 @@ impl ShallowClone for ChainStore {
             validated_blocks: self.validated_blocks.shallow_clone(),
             chain_config: self.chain_config.shallow_clone(),
             messages_in_tipset_cache: self.messages_in_tipset_cache.shallow_clone(),
+            last_clean_lookup_repair_epoch: self.last_clean_lookup_repair_epoch.shallow_clone(),
         }
     }
 }
@@ -175,7 +180,34 @@ impl ChainStore {
             ),
             chain_config,
             messages_in_tipset_cache: Default::default(),
+            last_clean_lookup_repair_epoch: Arc::new(AtomicI64::new(-1)),
         })
+    }
+
+    /// Verifies and repairs the epoch-to-tipset-key lookup table over the last
+    /// `chain_finality` epochs of the current head's lineage, returning the number of wrong
+    /// entries fixed. Scans that find nothing to repair are debounced per head epoch, so
+    /// bursts of validation failures (e.g. a peer feeding several bad forks) cost at most
+    /// one scan per head window.
+    pub fn repair_tipset_lookup(&self) -> anyhow::Result<usize> {
+        let head = self.heaviest_tipset();
+        if head.epoch()
+            <= self
+                .last_clean_lookup_repair_epoch
+                .load(atomic::Ordering::Acquire)
+        {
+            return Ok(0);
+        }
+        let n_repaired = self.chain_index.repair_tipset_lookup_window(
+            &head,
+            self.chain_config.policy.chain_finality,
+            self.ec_calculator_finalized_epoch(),
+        )?;
+        if n_repaired == 0 {
+            self.last_clean_lookup_repair_epoch
+                .store(head.epoch(), atomic::Ordering::Release);
+        }
+        Ok(n_repaired)
     }
 
     /// Sets F3 finalized tipset
@@ -215,29 +247,22 @@ impl ChainStore {
         self.ec_calculator_finalized_epoch
             .store(finalized_epoch, atomic::Ordering::Release);
 
-        // Updating tipset lookup table
+        // Updating tipset lookup table: only finalized ancestors of the head are legal
+        // content, see [`ChainIndex::update_tipset_lookup_for_finalized_head`].
+        if let Err(e) = self
+            .chain_index
+            .update_tipset_lookup_for_finalized_head(&head, finalized_epoch)
         {
-            // Only ever record finalized ancestors of the head. Recording the head itself
-            // is unsound: it is not finalized and may turn out to be a partial tipset or a
-            // fork block, permanently poisoning lookups once the epoch finalizes.
-            if let Err(e) = self
-                .chain_index
-                .update_tipset_lookup_for_finalized_head(&head, finalized_epoch)
-            {
-                error!("failed to update tipset lookup table: {e:#?}");
-            }
-            // Fix stale lookups at null rounds which could be caused by chain reorg.
-            // This is a no-op in most of the cases so it's OK to always run.
-            // (caching parent of head is intended as it's heavily used in Eth APIs as `latest`, while head is `pending`)
-            if let Ok(Some(parent)) = self.chain_index.load_tipset(head.parents())
-                && let Err(e) = ChainIndex::cleanup_stale_tipset_lookup_at_null_rounds(
-                    self.db(),
-                    &head,
-                    &parent,
-                )
-            {
-                error!("failed to cleanup stale null round lookups: {e:#?}");
-            }
+            error!("failed to update tipset lookup table: {e:#?}");
+        }
+        // Fix stale lookups at null rounds which could be caused by chain reorg.
+        // This is a no-op in most of the cases so it's OK to always run.
+        // (caching parent of head is intended as it's heavily used in Eth APIs as `latest`, while head is `pending`)
+        if let Ok(Some(parent)) = self.chain_index.load_tipset(head.parents())
+            && let Err(e) =
+                ChainIndex::cleanup_stale_tipset_lookup_at_null_rounds(self.db(), &head, &parent)
+        {
+            error!("failed to cleanup stale null round lookups: {e:#?}");
         }
 
         let old_head = self.heaviest_tipset.swap(head.shallow_clone().into());

@@ -32,6 +32,14 @@ impl StateManager {
         }
     }
 
+    /// Evicts the cached state output of a tipset so the next access recomputes it.
+    /// Used by the chain follower after repairing locally corrupted computation inputs
+    /// (e.g. a stale tipset lookup entry): the poisoned result must not be served from
+    /// the cache once its inputs are fixed.
+    pub fn invalidate_tipset_state(&self, tsk: &TipsetKey) {
+        self.cache.remove(tsk);
+    }
+
     /// State recomputation policy for RPC methods: recomputation is disabled unless explicitly
     /// enabled via the environment.
     fn rpc_state_recompute_policy() -> StateRecomputePolicy {
